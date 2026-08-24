@@ -1,0 +1,64 @@
+---
+title: "Dual Write vs. Transactional Outbox"
+description: "Killing a Redpanda broker mid-load loses 16 of 50,000 orders with dual write and zero with a transactional outbox, at 4 reps each."
+date: "2026-08-24"
+tags: ["backend", "postgres", "kafka", "architecture", "benchmarks", "go"]
+---
+
+Killing the broker mid-load loses 16 of 50,000 order events with dual write and zero with a transactional outbox, at 4 repetitions each, with zero duplicates in both. Write-path latency and end-to-end lag then trade places: dual write is slower and more variable to write, the outbox is faster to write but slower to arrive.
+
+## Question
+
+Two ways to get a Postgres row and its Kafka-compatible event to agree: commit then publish synchronously (dual write), or commit both the row and an outbox row in one transaction and let a relay poller publish it later (transactional outbox). When the broker dies mid-load and comes back, how many events does each strategy actually lose or duplicate, measured against the `orders` table as ground truth, not estimated?
+
+## Setup
+
+Go writer, Postgres 17 (`postgres:17-alpine`), Redpanda (`redpandadata/redpanda:v24.2.7`), one partition, one broker, no consumer group. 50,000 orders with a fixed seed (`rand.NewSource(42)`), 16 concurrent writers, each order producing exactly one event carrying its monotonic sequence id. A no-consumer-group reader drains the topic from offset 0 into an in-memory sink so a broker restart can't cost it committed offsets. Ground truth is the `orders` table; reconciliation is `lost = written - received` and `dupes = received - distinct(received)`, both exact set differences over sequence ids.
+
+Injection: when the write counter (not the wall clock) crosses 40% of N, `docker kill` the broker, wait 10 seconds, `docker start` it. Same trigger point for both strategies. A no-injection control arm runs for each strategy so steady-state behavior is visible separately from failure-induced behavior. 4 repetitions per arm/mode, rep 1 discarded as warm-up, giving 3 measured reps per cell — thin, but every injected rep agreed to the message, and this was run under a shared machine lock with other experiments queued behind it.
+
+A CDC arm via Debezium + Kafka Connect was planned as a third comparison. It was dropped: the shared machine ran out of disk mid-session (a `docker kill`/`storagefull` VM crash, unrelated to this experiment, confirmed in the OrbStack VM log) with under 10 GB free at the start, and Debezium plus Connect is roughly another gigabyte of images on top of what was already running. Two solid arms beat a third one measured on a machine that had already failed once. No CDC number appears anywhere in this repo.
+
+## What I expected
+
+That dual write would lose some events during the outage window and the outbox would lose none, because the outbox's failure mode is a growing queue rather than a dropped write. The open question was how many, and what it cost in latency to get zero.
+
+## What happened
+
+Dual write lost exactly 16 events in each of 3 measured injected reps (17 in the discarded warm-up rep — consistent, not noise) with 0 duplicates. The outbox arm lost 0 and duplicated 0 in every rep, injected or not. `publish_errors` in the dual-write inject reps matches the loss count exactly (16 and 16), which is the mechanism, not a coincidence: those are the writes whose `ProduceSync` call hit the 2-second delivery timeout while the broker was down, after the Postgres commit had already happened — data the app has no way to recover once the request returns.
+
+The trade lands where the design doc said it would. Dual write's write-path p50/p95/p99 barely moved between control and inject (6.65/9.98/16.49 ms vs 6.01/8.39/12.37 ms — if anything the inject numbers look slightly better, likely because the 16 requests that hit the outage just failed fast on timeout rather than waiting on a real broker round trip) but its end-to-end lag under injection had a max of 72.7 ms — nothing dramatic, because a dropped publish never shows up as lag, it shows up as a permanently missing row. The outbox's write path was consistently ~1 ms slower at p50 (7.60 ms control vs 6.65 ms dual write) because every write is two inserts in a transaction instead of one, but the real cost shows up in lag: control-arm lag p99 was already 22.4 ms (the relay's poll interval), and under injection the median lag jumped to 8.1 seconds and p99 to 18.1 seconds — the entire backlog built during the 10-second outage draining through a poller that has to catch up. Recovery time (from broker-back to consumer caught up on everything committed before the restart) was 0.00s for dual write, because it drops the messages instead of queueing them — recovery in the sense of "no backlog to clear" is trivially achieved by having thrown the data away — and a median of 8.19s for the outbox, which is closer to the true 10-second outage window than it might look, since the relay only starts draining once the broker answers again.
+
+## Numbers
+
+| arm        | mode           | lost | dupes | write p50/p95/p99 ms | lag p50/p99 ms   | recovery s |
+| ---------- | -------------- | ---- | ----- | -------------------- | ---------------- | ---------- |
+| dual write | control        | 0    | 0     | 6.65 / 9.98 / 16.49  | 0.7 / 2.5        | 0.00       |
+| dual write | broker restart | 16   | 0     | 6.01 / 8.39 / 12.37  | 0.6 / 1.9        | 0.00       |
+| outbox     | control        | 0    | 0     | 7.60 / 10.47 / 13.96 | 9.0 / 22.4       | 0.00       |
+| outbox     | broker restart | 0    | 0     | 6.77 / 9.43 / 12.62  | 8114.5 / 18090.0 | 8.19       |
+
+Medians over 3 measured reps (rep 1 of 4 discarded as warm-up), N=50,000 per rep. Full per-rep JSON and raw gzipped per-record output for all 16 runs (2 arms × 2 modes × 4 reps) are committed in `results/`.
+
+## Why
+
+Dual write's publish happens synchronously in the request path after the Postgres commit is already durable, so a broker outage during that window is a request that already told the database "yes" and then silently fails to tell the broker anything, with no transaction to roll back and no retry that the caller sees. The outbox never makes that promise inside the request: the event is durable in Postgres the moment the order is, and "publish" is a background concern the relay retries indefinitely against an at-least-once contract. That's also its stated weakness — publish-then-mark-sent means a relay crash between those two steps replays a batch, so consumers still need to be idempotent even though this run measured zero duplicates.
+
+## Decision
+
+Use the transactional outbox for order events, or anything else where a silently missing event is worse than a queue growing during an outage. Full reasoning, alternatives considered (including why an in-process retry queue doesn't actually solve this and why CDC was dropped rather than faked), and the consequences we're signing up for are in [ADR-0001](https://github.com/dhiazfathra/outbox-vs-dual-write/blob/main/docs/adr/0001-transactional-outbox-over-dual-write.md).
+
+## Threats to validity
+
+Single node, single partition, single broker, loopback networking — no real network partition, no multi-broker failover, no partition rebalancing. The outage is a clean `docker kill`/`docker start`, not a slow degradation, an OOM, or a rolling restart, and it is triggered at a fixed point in a fixed-seed synthetic workload, not under production traffic shape. 3 measured reps per cell is thin for the tails (p99, max); the medians agreed tightly across reps but a wider outage window or a different injection point could change the loss count materially, since it's driven by how many in-flight `ProduceSync` calls happen to straddle the exact restart. The consumer has no consumer group and reads from offset 0 every run, so this does not test rebalance-triggered duplication, only broker-restart duplication. The machine is a laptop under thermal and disk contention from other concurrent experiments sharing a `docker kill` benchmark lock — noisier than a dedicated benchmark host, though the loss/dupe counts (integers, ground-truth reconciled) are far less sensitive to that noise than the latency numbers are. Debezium/CDC is not evaluated at all; it was ruled in scope by the design but ruled out here for a documented, non-numerical reason (disk).
+
+## Rerun it
+
+```bash
+git clone https://github.com/dhiazfathra/outbox-vs-dual-write
+cd outbox-vs-dual-write
+docker compose up -d
+make bench
+```
+
+`make bench` runs `N=50000 REPS=4 ./run-bench.sh`, which builds the harness, runs both arms in both modes, and regenerates `results/SUMMARY.md`. Reduce `N` and `REPS` for a faster sanity check; the loss mechanism (both the count and its equality with `publish_errors`) should still be visible at `N=5000`.
