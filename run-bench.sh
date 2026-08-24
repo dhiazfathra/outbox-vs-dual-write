@@ -7,12 +7,10 @@ cd "$(dirname "$0")"
 N=${N:-50000}
 REPS=${REPS:-4}
 
-while ! mkdir /tmp/bench.lock 2>/dev/null; do
-	echo "waiting for /tmp/bench.lock ..."
-	sleep 20
-done
-trap 'rmdir /tmp/bench.lock' EXIT
+LOCK=/tmp/expbrief/benchlock.sh
+ME=outbox-vs-dual-write
 
+# Build and start everything BEFORE taking the lock: the lock covers load only.
 docker compose up -d
 echo "waiting for containers to be healthy ..."
 for _ in $(seq 1 60); do
@@ -24,6 +22,17 @@ docker inspect -f '{{.Name}} {{.State.Health.Status}}' ovd-postgres ovd-redpanda
 
 go build -o bin/bench .
 mkdir -p results
+
+if [ -x "$LOCK" ]; then
+	until "$LOCK" acquire "$ME"; do echo "re-issuing lock acquire ..."; done
+	release_lock() { "$LOCK" release "$ME" || true; }
+	# Only armed after a successful acquire, so it can never release someone
+	# else's lock; cleared explicitly once the matrix finishes.
+	trap release_lock EXIT
+else
+	echo "WARNING: $LOCK missing; running without the shared benchmark lock" >&2
+	release_lock() { :; }
+fi
 
 for arm in dualwrite outbox; do
 	for mode in control inject; do
@@ -38,6 +47,9 @@ for arm in dualwrite outbox; do
 		done
 	done
 done
+
+release_lock
+trap - EXIT
 
 go run ./cmd/aggregate >results/SUMMARY.md
 cat results/SUMMARY.md

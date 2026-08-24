@@ -42,9 +42,10 @@ docker compose up -d
 make bench
 ```
 
-`make bench` is the one command. It takes the shared `/tmp/bench.lock` so only
-one benchmark runs at a time on the machine, brings the stack up, waits for both
-health checks, then runs every arm and writes `results/`.
+`make bench` is the one command. It brings the stack up, waits for both health
+checks, builds, then takes the shared benchmark lock
+(`/tmp/expbrief/benchlock.sh`, if present on this machine) for the duration of
+the load only, runs every arm, releases the lock, and writes `results/`.
 
 Knobs: `N=50000 REPS=4 ./run-bench.sh`. Rep 1 of every arm is a warm-up and is
 discarded by the aggregator.
