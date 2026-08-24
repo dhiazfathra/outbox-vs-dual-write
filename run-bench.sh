@@ -34,6 +34,15 @@ else
 	release_lock() { :; }
 fi
 
+# Foreign load generators do not all take the lock. Wait for them to finish
+# before measuring; the lock alone is not proof of exclusive use.
+for _ in $(seq 1 120); do
+	foreign=$(ps -eo args | grep -Ei "k6 run|vegeta|wrk -|bakeoff" | grep -v grep | wc -l | tr -d ' ')
+	[ "$foreign" = "0" ] && break
+	echo "foreign load generator running ($foreign); waiting ..."
+	sleep 15
+done
+
 for arm in dualwrite outbox; do
 	for mode in control inject; do
 		for rep in $(seq 1 "$REPS"); do
