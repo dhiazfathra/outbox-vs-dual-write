@@ -123,7 +123,7 @@ func writeGzipJSON(path string, v any) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	zw := gzip.NewWriter(f)
 	if err := json.NewEncoder(zw).Encode(v); err != nil {
 		return err
