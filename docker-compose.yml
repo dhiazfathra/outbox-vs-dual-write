@@ -6,7 +6,7 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: bench
     command: ["postgres", "-c", "fsync=on", "-c", "max_connections=200"]
-    ports: ["55432:5432"]
+    ports: ["55437:5432"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d bench"]
       interval: 2s
@@ -25,9 +25,9 @@ services:
       - --reserve-memory=0M
       - --node-id=0
       - --check=false
-      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
-      - --advertise-kafka-addr=PLAINTEXT://127.0.0.1:19092
-    ports: ["19092:9092"]
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://127.0.0.1:19097
+    ports: ["19097:19092"]
     healthcheck:
       test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
       interval: 3s

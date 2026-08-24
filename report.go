@@ -71,7 +71,8 @@ func report(ctx context.Context, pool *pgxpool.Pool, c config, w *writerResult, 
 		LagP50Ms: percentile(lags, 0.50), LagP95Ms: percentile(lags, 0.95),
 		LagP99Ms: percentile(lags, 0.99), LagMaxMs: percentile(lags, 1.0),
 		WallS:       wall.Seconds(),
-		ThroughputW: float64(len(written)) / wall.Seconds(),
+		WriteWallS:  w.writeWall.Seconds(),
+		ThroughputW: float64(len(written)) / w.writeWall.Seconds(),
 	}
 	if inj.enabled && !inj.backAt.IsZero() {
 		s.KilledAt = inj.killedAt.Format(time.RFC3339Nano)
@@ -108,7 +109,10 @@ func recoverySeconds(written map[int64]bool, seen map[int64]int64, w *writerResu
 			last = recv
 		}
 	}
-	if last == 0 {
+	// A negative value means everything committed before the restart had
+	// already been delivered before the broker went down (nothing was queued
+	// for it to catch up on), so recovery is zero.
+	if last <= backNs {
 		return 0
 	}
 	return float64(last-backNs) / 1e9

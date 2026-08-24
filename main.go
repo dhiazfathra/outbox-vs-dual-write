@@ -20,7 +20,7 @@ import (
 const (
 	topic     = "orders"
 	brokerCtr = "ovd-redpanda"
-	broker    = "127.0.0.1:19092"
+	broker    = "127.0.0.1:19097"
 )
 
 type config struct {
@@ -57,6 +57,7 @@ type summary struct {
 	LagP99Ms    float64 `json:"e2e_lag_p99_ms"`
 	LagMaxMs    float64 `json:"e2e_lag_max_ms"`
 	RecoveryS   float64 `json:"recovery_s"`
+	WriteWallS  float64 `json:"write_wall_s"`
 	WallS       float64 `json:"wall_s"`
 	KilledAt    string  `json:"killed_at,omitempty"`
 	BackAt      string  `json:"back_at,omitempty"`
@@ -71,7 +72,7 @@ func main() {
 	flag.Float64Var(&c.injectPct, "inject-pct", 0.40, "fraction of writes before the kill")
 	flag.DurationVar(&c.killPause, "kill-pause", 10*time.Second, "how long the broker stays down")
 	flag.StringVar(&c.out, "out", "results", "output directory")
-	flag.StringVar(&c.dsn, "dsn", "postgres://postgres:postgres@127.0.0.1:55432/bench", "postgres dsn")
+	flag.StringVar(&c.dsn, "dsn", "postgres://postgres:postgres@127.0.0.1:55437/bench", "postgres dsn")
 	flag.IntVar(&c.rep, "rep", 1, "repetition number (1 = warm-up, discarded)")
 	flag.Parse()
 
@@ -172,7 +173,8 @@ func (i *injector) maybeFire(count int64) {
 func (i *injector) wait() { i.done.Wait() }
 
 type writerResult struct {
-	commitNs  []int64 // index = seq
+	writeWall time.Duration // writer phase only, excludes relay catch-up
+	commitNs  []int64       // index = seq
 	latencyNs []int64
 	pubErrs   int64
 }

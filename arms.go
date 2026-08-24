@@ -61,6 +61,7 @@ func runDualWrite(ctx context.Context, pool *pgxpool.Pool, c config, inj *inject
 	amounts := dataset(c.n)
 	var counter atomic.Int64
 	var wg sync.WaitGroup
+	t0all := time.Now()
 	for w := 0; w < c.workers; w++ {
 		wg.Add(1)
 		go func() {
@@ -91,6 +92,7 @@ func runDualWrite(ctx context.Context, pool *pgxpool.Pool, c config, inj *inject
 		}()
 	}
 	wg.Wait()
+	res.writeWall = time.Since(t0all)
 	return res, nil
 }
 
@@ -120,6 +122,7 @@ func runOutbox(ctx context.Context, pool *pgxpool.Pool, c config, inj *injector)
 	}()
 
 	var wg sync.WaitGroup
+	t0all := time.Now()
 	for w := 0; w < c.workers; w++ {
 		wg.Add(1)
 		go func() {
@@ -158,6 +161,7 @@ func runOutbox(ctx context.Context, pool *pgxpool.Pool, c config, inj *injector)
 		}()
 	}
 	wg.Wait()
+	res.writeWall = time.Since(t0all)
 	close(writersDone)
 	<-relayDone
 	return res, nil
